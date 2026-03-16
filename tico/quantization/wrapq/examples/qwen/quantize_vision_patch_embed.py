@@ -26,66 +26,55 @@ from tico.quantization.evaluation.metric import compute_peir
 from tico.quantization.evaluation.utils import plot_two_outputs
 from tico.quantization.wrapq.utils.version import has_transformers_for
 
+torch.manual_seed(123)
+
+
 # Check if transformers is available
 
 if not has_transformers_for("qwen3-vl"):
     print(
-        "Error: transformers package not installed. Cannot test Qwen3VLVisionPatchMerger."
+        "Error: Required transformers package not installed. Cannot test Qwen3VLVisionPatchEmbed."
     )
     sys.exit(1)
 
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionPatchMerger
+from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionPatchEmbed
 
 
-def generate_calibration_data(
-    batch_size: int, num_patches: int, hidden_size: int
-) -> list:
+def generate_calibration_data(batch_size: int, sample_shape) -> list:
     """Generate calibration data for PTQ"""
     calibration_data = []
     for i in range(batch_size):
-        x = torch.randn(num_patches, hidden_size)
+        x = torch.randn(sample_shape)
         calibration_data.append(x)
     return calibration_data
 
 
 def main():
-    # Create the vision patch merger model
+    # Create the vision patch embed model
     cfg = Qwen3VLVisionConfig(
+        in_channels=3,
         hidden_size=1024,
-        spatial_merge_size=2,
-        out_hidden_size=2048,
+        temporal_merge_size=2,
+        patch_size=16,
     )
-    model = Qwen3VLVisionPatchMerger(cfg, use_postshuffle_norm=False)
+    model = Qwen3VLVisionPatchEmbed(cfg)
     orig_model = copy.deepcopy(model)
     model.eval()
 
-    # Qwen3VLVisionPatchMerger(
-    #     (norm): LayerNorm(4096, eps=1e-06, elementwise_affine=True)
-    #     (linear_fc1): Linear(in_features=4096, out_features=4096, bias=True)
-    #     (act_fn): GELU(approximation='none')
-    #     (linear_fc2): Linear(in_features=4096, out_features=2048, bias=True)
+    # Qwen3VLVisionPatchEmbed(
+    #     (proj): Conv3d(3, 1024, kernel_size=(2, 16, 16), stride=(2, 16, 16))
     # )
-    assert (
-        model.hidden_size == 4096
-    )  # cfg.hidden_size * (cfg.spatial_merge_size**2) = 1024 * 2**2
-    assert model.linear_fc1.in_features == 4096
-    assert model.linear_fc1.out_features == 4096
-    assert model.linear_fc2.in_features == 4096
-    assert model.linear_fc2.out_features == 2048
+    assert model.proj.in_channels == 3
+    assert model.proj.out_channels == 1024
+    assert model.proj.kernel_size == (2, 16, 16)
+    assert model.proj.stride == (2, 16, 16)
 
     # Generate calibration data
-    # Input shape: (num_patches, hidden_size)
-    # Example: input.shape=(num_patches=32, hidden_size=1024)
-    #     num_patches=32 can come from e.g. two 8-frame videos 32x32 pixels RGB channels after they are embedded by Qwen3VLVisionPatchEmbed (Conv3d):
-    #     (Batch, Channels, Time, Height, Width) = (2, 3, 4, 32, 32) --> Qwen3VLVisionPatchEmbed --> (num_patches, hidden_size) = (2*4*4, 1024),
-    #     where 2*4*4 means (2 videos) times (4 spatial patches) times (4 temporal patches).
-    #     4 spatial patches can come from 32x32 frame with stride 16: 32/16 * 32/16 = 2*2 = 4.
-    #     4 temporal patches can come from 8 frames with stride 2: 8 / 2 = 4.
-    num_patches = 32
-    hidden_size = cfg.hidden_size
+    # Input shape: (batch_size, in_channels, depth, height, width)
+    # Example: (2, 3, 8, 224, 224) - 2 videos, RGB, 8 frames, 224x224 resolution
     calibration_data = generate_calibration_data(
-        batch_size=20, num_patches=num_patches, hidden_size=hidden_size
+        batch_size=20, sample_shape=(2, 3, 8, 224, 224)
     )
 
     # Configure PTQ
@@ -116,12 +105,12 @@ def main():
     print(plot_two_outputs(fp_out, quant_out))
 
     # Convert to Circle format
-    # example_inputs shape: (num_patches, hidden_size)
-    example_inputs = (torch.randn(num_patches, hidden_size),)
-    circle_model = tico.convert(quantized_model, example_inputs)
+    # example_inputs shape: (batch_size, in_channels, depth, height, width)
+    example_inputs = (torch.randn(2, 3, 8, 224, 224),)
+    circle_model = tico.convert(quantized_model.eval(), example_inputs)
 
     # Save the Circle model
-    filename = "quantized_vision_patch_merger.circle"
+    filename = "qwen3vl_vision_patch_embed.q.circle"
     circle_model.save(filename)
     print(f"Circle model saved as '{filename}'")
 

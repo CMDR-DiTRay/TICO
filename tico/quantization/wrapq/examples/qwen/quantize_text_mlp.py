@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Samsung Electronics Co., Ltd. All Rights Reserved
+# Copyright (c) 2026 Samsung Electronics Co., Ltd. All Rights Reserved
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,27 +15,27 @@
 import pathlib
 
 import torch
-from transformers import AutoModelForVision2Seq, AutoTokenizer
+from transformers import AutoModelForImageTextToText, AutoTokenizer
 
 from tico.quantization import convert, prepare
 from tico.quantization.config.ptq import PTQConfig
 from tico.quantization.evaluation.metric import compute_peir
 from tico.quantization.evaluation.utils import plot_two_outputs
 from tico.quantization.wrapq.mode import Mode
-from tico.quantization.wrapq.wrappers.qwen_vl.quant_text_attn import (
-    QuantQwen3VLTextAttention,
-)
+from tico.quantization.wrapq.wrappers.qwen_vl.quant_text_mlp import QuantQwen3VLTextMLP
 from tico.utils.utils import SuppressWarning
+
+torch.manual_seed(123)
+
 
 # -------------------------------------------------------------------------
 # 0. Load a Qwen3-VL model (text tower) + tokenizer
 # -------------------------------------------------------------------------
 name = "Qwen/Qwen3-VL-2B-Instruct"
-model = AutoModelForVision2Seq.from_pretrained(
+model = AutoModelForImageTextToText.from_pretrained(
     name,
     device_map="cpu",
     trust_remote_code=True,
-    dtype=torch.float32,
 )
 tokenizer = AutoTokenizer.from_pretrained(name, trust_remote_code=True)
 
@@ -60,90 +60,55 @@ text_cfg = model.config.text_config
 text_cfg.max_position_embeddings = MAX_SEQ
 
 # -------------------------------------------------------------------------
-# 1. Replace layer-0’s self-attention with QuantQwen3VLTextAttention
+# 1. Replace layer-0's MLP with QuantQwen3VLTextMLP
 # -------------------------------------------------------------------------
-orig_attn = model.model.language_model.layers[0].self_attn
-model.model.language_model.layers[0].self_attn = prepare(orig_attn, PTQConfig())
-model.eval()
+orig_mlp = model.model.language_model.layers[0].mlp
+mlp_q = prepare(orig_mlp, PTQConfig())
+mlp_q.eval()
 
-attn_q = model.model.language_model.layers[0].self_attn
-assert isinstance(attn_q.wrapped, QuantQwen3VLTextAttention)
-
-# -------------------------------------------------------------------------
-# Helpers: fixed-length tokenize + embed
-# -------------------------------------------------------------------------
-def make_fixed_inputs(prompt: str):
-    batch = tokenizer(
-        prompt,
-        return_tensors="pt",
-        padding="max_length",
-        truncation=True,
-        max_length=MAX_SEQ,
-    )
-    input_ids = batch["input_ids"]  # [1,MAX_SEQ]
-
-    hidden = model.model.language_model.embed_tokens(input_ids)  # [1,MAX_SEQ,D]
-    return hidden
-
+assert isinstance(mlp_q.wrapped, QuantQwen3VLTextMLP)
 
 # -------------------------------------------------------------------------
 # 2. Single-pass calibration
 # -------------------------------------------------------------------------
-PROMPTS = [
-    "The quick brown fox jumps over the lazy dog.",
-    "In 2025, AI systems accelerated hardware-software co-design at scale.",
-    "양자화는 왜 어려울까? 분포, 길이, 마스크가 관건이다.",
-    "今日はいい天気ですね。ところでRoPE角度は長さに依存します。",
-    "def quicksort(arr):\n    if len(arr) <= 1: return arr\n    ...",
-    "Prices rose 3.14% — see Figure 2; emails: foo@bar.com!",
-]
+CALIB_TENSORS = []
+for _ in range(10):
+    ct = torch.randn(5, MAX_SEQ, text_cfg.hidden_size)
+    CALIB_TENSORS.append(ct)
 
 with torch.no_grad():
-    for prompt in PROMPTS:
-        hidden = make_fixed_inputs(prompt)
-        rotary = model.model.language_model.rotary_emb
-        position_ids = torch.arange(MAX_SEQ).unsqueeze(0)
-        pos = rotary(hidden, position_ids)
-        _ = attn_q(hidden, pos)
+    for ct in CALIB_TENSORS:
+        _ = mlp_q(ct)
 
-convert(attn_q)
-assert attn_q._mode is Mode.QUANT, "Quantization mode should be active now."
+convert(mlp_q)
+assert mlp_q._mode is Mode.QUANT, "Quantization mode should be active now."
 
 # -------------------------------------------------------------------------
 # 3. Quick diff check (INT-sim vs FP32)
 # -------------------------------------------------------------------------
-hidden = make_fixed_inputs("check")
+hidden = CALIB_TENSORS[3]
 
 with torch.no_grad():
-    rotary = model.model.language_model.rotary_emb
-    position_ids = torch.arange(MAX_SEQ).unsqueeze(0)
-    pos = rotary(hidden, position_ids)
-
-    int8_out, _ = attn_q(hidden, pos)
-
-    mask = torch.full((1, 1, MAX_SEQ, MAX_SEQ), float("-120"))
-    mask.triu_(1)
-    fp_out, _ = orig_attn(hidden, position_embeddings=pos, attention_mask=mask)
+    quant_out = mlp_q(hidden)
+    fp_out = orig_mlp(hidden)
 
 print("┌───────────── Quantization Error Summary ─────────────")
-print(f"│ Mean |diff|: {(int8_out - fp_out).abs().mean().item():.6f}")
-print(f"│ PEIR       : {compute_peir(fp_out, int8_out) * 100:.6f} %")
+print(f"│ Mean |diff|: {(quant_out - fp_out).abs().mean().item():.6f}")
+print(f"│ PEIR       : {compute_peir(fp_out, quant_out) * 100:.6f} %")
 print("└──────────────────────────────────────────────────────")
-print(plot_two_outputs(fp_out, int8_out))
+print(plot_two_outputs(fp_out, quant_out))
 
 # -------------------------------------------------------------------------
 # 4. Export the quantized block
 # -------------------------------------------------------------------------
 import tico
 
-save_path = pathlib.Path("qwen3vl_text_attn.q.circle")
+save_path = pathlib.Path("qwen3vl_text_mlp.q.circle")
 B, S, D = 1, MAX_SEQ, text_cfg.hidden_size
 example = torch.randn(B, S, D)
-example_ids = torch.arange(S)[None, :]
-example_pos = rotary(example, example_ids)
 
 with SuppressWarning(UserWarning, ".*"):
-    cm = tico.convert(attn_q, (example, example_pos, None))
+    cm = tico.convert(mlp_q, (example,))
 cm.save(save_path)
 
 print(f"Quantized Circle model saved to {save_path.resolve()}")

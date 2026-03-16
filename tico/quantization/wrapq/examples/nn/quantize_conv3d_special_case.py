@@ -24,55 +24,74 @@ import tico.quantization
 import tico.quantization.config.ptq
 from tico.quantization.evaluation.metric import compute_peir
 from tico.quantization.evaluation.utils import plot_two_outputs
-from tico.quantization.wrapq.utils.version import has_transformers_for
-
-# Check if transformers is available
-
-if not has_transformers_for("qwen3-vl"):
-    print(
-        "Error: Required transformers package not installed. Cannot test Qwen3VLVisionPatchEmbed."
-    )
-    sys.exit(1)
-
-from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig
-from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionPatchEmbed
 
 
-def generate_calibration_data(batch_size: int, sample_shape) -> list:
+torch.manual_seed(123)
+
+
+def generate_calibration_data(
+    num_batches: int,
+    batch_size: int,
+    in_channels: int,
+    depth: int,
+    height: int,
+    width: int,
+) -> list:
     """Generate calibration data for PTQ"""
     calibration_data = []
-    for i in range(batch_size):
-        x = torch.randn(sample_shape)
+    for i in range(num_batches):
+        x = torch.randn(batch_size, in_channels, depth, height, width)
         calibration_data.append(x)
     return calibration_data
 
 
 def main():
-    # Create the vision patch embed model
-    cfg = Qwen3VLVisionConfig(
+    # Create a Conv3d that meets the special case conditions
+    # Input: (N=2, C=3, T=2, H=16, W=16)
+    # Kernel: (2, 16, 16) - matches temporal and spatial dimensions
+    # Stride: (2, 16, 16) - equals kernel size
+    # Padding: 0
+    model = nn.Conv3d(
         in_channels=3,
-        hidden_size=1024,
-        temporal_merge_size=2,
-        patch_size=16,
+        out_channels=1024,
+        kernel_size=(2, 16, 16),
+        stride=(2, 16, 16),
+        padding=0,
+        bias=True,
+        groups=1,
     )
-    model = Qwen3VLVisionPatchEmbed(cfg)
     orig_model = copy.deepcopy(model)
     model.eval()
 
-    # Qwen3VLVisionPatchEmbed(
-    #     (proj): Conv3d(3, 1024, kernel_size=(2, 16, 16), stride=(2, 16, 16))
+    # Model architecture:
+    # Conv3d(
+    #     (weight): Parameter [1024, 3, 2, 16, 16]
+    #     (bias): Parameter [1024]
     # )
-    assert model.proj.in_channels == 3
-    assert model.proj.out_channels == 1024
-    assert model.proj.kernel_size == (2, 16, 16)
-    assert model.proj.stride == (2, 16, 16)
 
-    # Generate calibration data
+    print(f"Input channels:  {model.in_channels}")
+    print(f"Output channels: {model.out_channels}")
+    print(f"Kernel size:     {model.kernel_size}")
+    print(f"Stride:          {model.stride}")
+    print(f"Padding:         {model.padding}")
+
+    # Generate calibration data that matches the kernel size in temporal and spatial dimensions.
     # Input shape: (batch_size, in_channels, depth, height, width)
-    # Example: (2, 3, 8, 224, 224) - 2 videos, RGB, 8 frames, 224x224 resolution
+    # Example: (10, 3, 2, 16, 16) - 10 samples, 3 channels (RGB), 2 frames, 16×16 pixels
+    batch_size = 10
+    in_channels = 3
+    depth = 2
+    height = 16
+    width = 16
     calibration_data = generate_calibration_data(
-        batch_size=20, sample_shape=(2, 3, 8, 224, 224)
+        num_batches=2,
+        batch_size=batch_size,
+        in_channels=in_channels,
+        depth=depth,
+        height=height,
+        width=width,
     )
+    example_input = calibration_data[0]
 
     # Configure PTQ
     ptq_config = tico.quantization.config.ptq.PTQConfig()
@@ -92,9 +111,12 @@ def main():
 
     # Compute PEIR (Peak Error-to-Input Ratio) between quantized model and original model
     with torch.no_grad():
-        quant_out = quantized_model(calibration_data[0])
-        fp_out = orig_model(calibration_data[0])
+        quant_out = quantized_model(example_input)
+        fp_out = orig_model(example_input)
 
+    print(f"Input shape:              {example_input.shape}")
+    print(f"Output shape (FP32):      {fp_out.shape}")
+    print(f"Output shape (Quantized): {quant_out.shape}")
     print(f"┌───────────── Quantization Error Summary ─────────────")
     print(f"│ Mean |diff|: {(quant_out - fp_out).abs().mean().item():.6f}")
     print(f"│ PEIR       : {compute_peir(fp_out, quant_out) * 100:.6f} %")
@@ -102,12 +124,11 @@ def main():
     print(plot_two_outputs(fp_out, quant_out))
 
     # Convert to Circle format
-    # example_inputs shape: (batch_size, in_channels, depth, height, width)
-    example_inputs = (torch.randn(2, 3, 8, 224, 224),)
-    circle_model = tico.convert(quantized_model, example_inputs)
+    print("\nConverting to Circle format...")
+    circle_model = tico.convert(quantized_model.eval(), (example_input,))
 
     # Save the Circle model
-    filename = "quantized_vision_patch_embed.circle"
+    filename = "quantized_conv3d.circle"
     circle_model.save(filename)
     print(f"Circle model saved as '{filename}'")
 

@@ -26,6 +26,7 @@
 # =============================================================================
 
 import argparse
+
 import pathlib
 import random
 
@@ -39,14 +40,10 @@ from datasets import load_dataset
 from lm_eval.utils import make_table
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from transformers.cache_utils import Cache
-from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.models.llama.modeling_llama import KwargsForCausalLM, LlamaForCausalLM
-from transformers.processing_utils import Unpack
-
 import tico
 
 from tico.quantization import convert, prepare
+from tico.quantization.algorithm.gptq.utils import SensitivityCalibrator
 from tico.quantization.config.gptq import GPTQConfig
 from tico.quantization.config.ptq import PTQConfig
 from tico.quantization.evaluation.script.llm_tasks_eval import evaluate_llm_on_tasks
@@ -107,54 +104,6 @@ def inject_gptq_qparams(
 def save_circles_to(q_m, calib_inputs, save_circle_to_folder):
     q_m.eval()
     q_m.cpu()
-    save_path = pathlib.Path(save_circle_to_folder, "embedding.q.circle")
-    pathlib.Path()
-    print(f"saving input embedding to {save_path.resolve()}")
-    with torch.no_grad():
-        with SuppressWarning(UserWarning, ".*"):
-            cm = tico.convert(
-                q_m.model.embed_tokens,
-                (calib_inputs[0],),
-                strict=False,
-            )
-            cm.save(save_path)
-
-    save_path = pathlib.Path(save_circle_to_folder, "lm_head.q.circle")
-    print(f"saving lm_head to {save_path.resolve()}")
-    with torch.no_grad():
-        with SuppressWarning(UserWarning, ".*"):
-            B, S, D = 1, q_m.config.max_position_embeddings, q_m.config.hidden_size
-            example_hidden = torch.randn(B, S, D)
-            cm = tico.convert(
-                q_m.lm_head,
-                (example_hidden,),
-                strict=False,
-            )
-            cm.save(save_path)
-
-    print("saving layers")
-    for i in range(len(q_m.model.layers)):
-        save_path = pathlib.Path(save_circle_to_folder, f"decoder_layer_{i}.q.circle")
-        print(f"saving model layer_{i} to {save_path.resolve()}")
-        B, S, D = 1, q_m.config.max_position_embeddings, q_m.config.hidden_size
-        example_hidden = torch.randn(B, S, D)
-
-        with torch.no_grad():
-            with SuppressWarning(UserWarning, ".*"):
-                cm = tico.convert(
-                    q_m.model.layers[i],
-                    (example_hidden,),
-                    strict=False,
-                )
-        cm.save(save_path)
-
-    save_path = pathlib.Path(save_circle_to_folder, "model.model.q.circle")
-    print(f"saving model.model to {save_path.resolve()}")
-    with torch.no_grad():
-        with SuppressWarning(UserWarning, ".*"):
-            cm = tico.convert(q_m.model, (calib_inputs[0],), strict=False)
-
-            cm.save(save_path)
 
     save_path = pathlib.Path(save_circle_to_folder, "model.q.circle")
     print(f"saving the whole model to {save_path.resolve()}")
@@ -221,14 +170,21 @@ def quantize_using_PTQ(q_m, calib_inputs, args):
     cfg = PTQConfig(
         default_dtype=DType.int(16),
         default_qscheme=QScheme.PER_TENSOR_SYMM,
+        wrapper_variant="prefill",
         overrides={
-            "model.embeddings": {
-                "weight": {
-                    "dtype": (
-                        DType.uint(args.embedding_weight_bits)
-                        if args.embedding_weight_bits < 16
-                        else DType.int(args.embedding_weight_bits)
-                    ),
+            "model": {
+                "embed_tokens": {
+                    "weight": {
+                        "dtype": (
+                            DType.uint(args.embedding_weight_bits)
+                            if args.embedding_weight_bits < 16
+                            else DType.int(args.embedding_weight_bits)
+                        ),
+                    },
+                },
+                "layers": {},
+                "norm": {
+                    "weight": {"dtype": DType.int(16)},
                 },
             },
             "lm_head": {
@@ -240,17 +196,14 @@ def quantize_using_PTQ(q_m, calib_inputs, args):
                     ),
                 },
             },
-            "model.norm": {
-                "weight": {"dtype": DType.int(16)},
-            },
         },
     )
     for i in range(len(q_m.model.layers)):
-        child_scope = f"layer{i}"
-        cfg.overrides[child_scope] = w_cfg  # type: ignore[index]
+        child_scope = f"{i}"
+        cfg.overrides["model"]["layers"][child_scope] = w_cfg  # type: ignore[index]
 
     qcfg = cfg
-    prepare(q_m, qcfg)
+    q_m = prepare(q_m, qcfg)
 
     # -------------------------------------------------------------------------
     # Single-pass activation calibration
@@ -260,6 +213,12 @@ def quantize_using_PTQ(q_m, calib_inputs, args):
     # Overwrite weight observers with GPTQ statistics
     if hasattr(q_m, "quantizers") and isinstance(q_m.quantizers, dict):
         inject_gptq_qparams(q_m, q_m.quantizers)
+    elif (
+        hasattr(q_m, "wrapped")
+        and hasattr(q_m.wrapped, "quantizers")
+        and isinstance(q_m.wrapped.quantizers, dict)
+    ):
+        inject_gptq_qparams(q_m.wrapped, q_m.wrapped.quantizers)
     else:
         print(
             "[Warn] q_m.quantizers not found or not a dict; skipping GPTQ qparam injection."
@@ -276,83 +235,6 @@ def quantize_using_PTQ(q_m, calib_inputs, args):
     return q_m
 
 
-def fix_inputs(model, tokenizer, input_ids):
-    if tokenizer.pad_token_id is not None:
-        pads = torch.full(
-            (
-                input_ids.shape[0],
-                model.config.max_position_embeddings - input_ids.shape[1],
-            ),
-            fill_value=tokenizer.pad_token_id,
-            device=input_ids.device,
-        )
-    elif tokenizer.eos_token_id is not None:
-        pads = torch.full(
-            (
-                input_ids.shape[0],
-                model.config.max_position_embeddings - input_ids.shape[1],
-            ),
-            fill_value=tokenizer.eos_token_id,
-            device=input_ids.device,
-        )
-    else:
-        raise RuntimeError(
-            "failed to pad sequence - tokenizer doesn't have pad_token_id/eos_token_id"
-        )
-
-    return torch.cat((input_ids, pads), dim=1)
-
-
-class LLamaWithFixedInput(LlamaForCausalLM):
-    def __init__(self, parent: LlamaForCausalLM, tokenizer):
-        assert parent.config is not None, "config is a must have"
-        super().__init__(parent.config)
-        self.__dict__.update(parent.__dict__)
-
-        def forward(
-            self,
-            input_ids: torch.LongTensor = None,  # type: ignore[assignment]
-            attention_mask: Optional[torch.Tensor] = None,
-            position_ids: Optional[torch.LongTensor] = None,
-            past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-            inputs_embeds: Optional[torch.FloatTensor] = None,
-            labels: Optional[torch.LongTensor] = None,
-            use_cache: Optional[bool] = None,
-            output_attentions: Optional[bool] = None,
-            output_hidden_states: Optional[bool] = None,
-            return_dict: Optional[bool] = None,
-            cache_position: Optional[torch.LongTensor] = None,
-            logits_to_keep: Union[int, torch.Tensor] = 0,
-            **kwargs: Unpack[KwargsForCausalLM],
-        ) -> Union[Tuple, CausalLMOutputWithPast]:
-            # fixed input size, due to position_ids fixed
-            orig_len = input_ids.shape[-1]
-            input_ids = fix_inputs(self, self.tokenizer, input_ids)
-            if labels is not None:
-                labels = fix_inputs(self, self.tokenizer, labels)
-            res = super().forward(
-                input_ids,
-                attention_mask,
-                position_ids,
-                past_key_values,
-                inputs_embeds,
-                labels,
-                use_cache,
-                output_attentions,
-                output_hidden_states,
-                return_dict,
-                cache_position,
-                logits_to_keep,
-                **kwargs,
-            )
-            # we need to trim to the original size
-            res.logits = res.logits[..., :orig_len, :]
-            return res
-
-        self.forward = types.MethodType(forward, self)
-        self.tokenizer = tokenizer
-
-
 def evaluate(q_m, tokenizer, dataset_test, args):
     # -------------------------------------------------------------------------
     # Evaluate perplexity on Wikitext-2
@@ -360,7 +242,7 @@ def evaluate(q_m, tokenizer, dataset_test, args):
     print("\nCalculating perplexities …")
     enc = tokenizer("\n\n".join(dataset_test["text"]), return_tensors="pt")
     ppl_uint8 = perplexity(
-        q_m, enc, args.device, stride=q_m.config.max_position_embeddings
+        q_m, enc, args.device, max_length=args.max_seq_len, stride=args.max_seq_len
     )
 
     print("\n┌── Wikitext-2 test perplexity ─────────────")
@@ -368,7 +250,9 @@ def evaluate(q_m, tokenizer, dataset_test, args):
     print("└───────────────────────────────────────────")
 
     if args.eval_tasks is not None:
-        results = evaluate_llm_on_tasks(q_m, tokenizer, args.eval_tasks)
+        results = evaluate_llm_on_tasks(
+            q_m, tokenizer, args.eval_tasks, max_length=args.max_seq_len
+        )
         print("Quantized RESULTS ARE:")
         print(make_table(results))
 
@@ -445,15 +329,22 @@ def main():
     )
     parser.add_argument(
         "--gptq_mse",
-        action="store_true",
-        default=False,
-        help="Whether to use mse in gptq",
+        type=str,
+        default=None,
+        choices=["mse", "smse"],
+        help="Whether and how to use mse in gptq (none/mse/smse/)",
     )
     parser.add_argument(
         "--max_seq_len",
         type=int,
         default=None,
-        help="constraint for max_position_embeddings",
+        help="seq_len to use in model evaluation and conversion to circle",
+    )
+    parser.add_argument(
+        "--calibrate_seq_len",
+        type=int,
+        default=2048,
+        help="seq_len to use in quantized model calibration. More the better",
     )
     parser.add_argument(
         "--embedding_weight_bits",
@@ -472,6 +363,11 @@ def main():
         type=str,
         default=None,
         help="tasks to be evaluated using lm_eval, e.g. `winogrande,arc_easy,arc_challenge,openbookqa,mmlu_pro,ifeval,bbh`",
+    )
+    parser.add_argument(
+        "--sensitivity_path",
+        type=str,
+        default=None,
     )
     args = parser.parse_args()
     print(args)
@@ -500,7 +396,7 @@ def main():
     model = (
         AutoModelForCausalLM.from_pretrained(
             args.model,
-            torch_dtype=dtype,
+            dtype=dtype,
             trust_remote_code=args.trust_remote_code,
             token=args.hf_token,
             cache_dir=args.cache_dir,
@@ -510,9 +406,9 @@ def main():
     )
 
     model.config.use_cache = False  # TODO use args for it
-    if args.max_seq_len is not None:
+    if args.calibrate_seq_len is not None:
         model.config.max_position_embeddings = min(
-            model.config.max_position_embeddings, args.max_seq_len
+            model.config.max_position_embeddings, args.calibrate_seq_len
         )
 
     dataset_test = load_dataset(
@@ -522,7 +418,7 @@ def main():
     print("\nCalculating original perplexities …")
     enc = tokenizer("\n\n".join(dataset_test["text"]), return_tensors="pt")
     ppl_fp32 = perplexity(
-        model, enc, device, stride=model.config.max_position_embeddings
+        model, enc, device, max_length=args.max_seq_len, stride=args.max_seq_len
     )
 
     print("\n┌── Wikitext-2 test perplexity ─────────────")
@@ -530,7 +426,9 @@ def main():
     print("└───────────────────────────────────────────")
 
     if args.eval_tasks is not None:
-        results = evaluate_llm_on_tasks(model, tokenizer, args.eval_tasks)
+        results = evaluate_llm_on_tasks(
+            model, tokenizer, args.eval_tasks, max_length=args.max_seq_len
+        )
         print("Original RESULTS ARE:")
         print(make_table(results))
 
@@ -557,8 +455,19 @@ def main():
         if not args.no_GPTQ:
             print("Applying GPTQ …")
 
+        sens = None
+        if args.gptq_mse is not None and args.gptq_mse == "smse":
+            if args.sensitivity_path is not None:
+                sens = torch.load(args.sensitivity_path)
+            else:
+                calibrator = SensitivityCalibrator(model, tokenizer, calib_inputs)
+                sens = calibrator.compute_sensitivity_info()
+
         gptq_config = GPTQConfig(
-            weight_bits=args.linear_weight_bits, perchannel=True, mse=args.gptq_mse
+            weight_bits=args.linear_weight_bits,
+            perchannel=True,
+            mse=args.gptq_mse,
+            sensitivity=sens,
         )
         q_m = prepare(model, gptq_config, inplace=True)
         with torch.no_grad():
@@ -576,9 +485,10 @@ def main():
         q_m = quantize_using_PTQ(q_m, calib_inputs, args)
 
     # after PTQ quantizer only fixed-length input sequences are valid
-    evaluate(LLamaWithFixedInput(q_m, tokenizer), tokenizer, dataset_test, args)
+    evaluate(q_m, tokenizer, dataset_test, args)
 
     if args.save_circle_to_folder is not None:
+        calib_inputs = list(torch.stack(calib_inputs).reshape(-1, 1, args.max_seq_len))
         save_circles_to(q_m, calib_inputs, args.save_circle_to_folder)
 
 

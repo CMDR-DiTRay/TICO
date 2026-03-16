@@ -14,24 +14,25 @@
 
 """
 The tests run only if *transformers* is available (they depend on the genuine
-`transformers.models.llama.modeling_llama.LlamaModel`).
+`transformers.models.llama.modeling_llama.LlamaForCausalLM`).
 """
 
 import unittest
 
 import torch
-from tico.quantization.config.ptq import PTQConfig
 
-from tico.quantization.wrapq.dtypes import DType
+from tico.quantization.config.ptq import PTQConfig
 from tico.quantization.wrapq.mode import Mode
 from tico.quantization.wrapq.utils.version import has_transformers_for
-from tico.quantization.wrapq.wrappers.llama.quant_model import QuantLlamaModel
+from tico.quantization.wrapq.wrappers.llama.quant_model_for_causal_lm import (
+    QuantLlamaForCausalLM,
+)
 
-skip_msg = "required transformers not installed — skipping LlamaModel tests"
+skip_msg = "required transformers not installed — skipping LlamaForCausalLM tests"
 
 
 @unittest.skipUnless(has_transformers_for("llama"), skip_msg)
-class TestQuantLlamaModel(unittest.TestCase):
+class TestQuantLlamaForCausalLM(unittest.TestCase):
     seq_len: int
     vocab_size: int
     fp_model: torch.nn.Module
@@ -41,7 +42,7 @@ class TestQuantLlamaModel(unittest.TestCase):
         torch.manual_seed(0)
 
         from transformers.models.llama.configuration_llama import LlamaConfig
-        from transformers.models.llama.modeling_llama import LlamaModel
+        from transformers.models.llama.modeling_llama import LlamaForCausalLM
 
         cls.seq_len = 16
         cls.vocab_size = 10000
@@ -56,12 +57,11 @@ class TestQuantLlamaModel(unittest.TestCase):
             num_hidden_layers=2,
             max_position_embeddings=cls.seq_len,
             use_cache=False,
-            return_dict=False,
         )
-        cls.fp_model = LlamaModel(cfg)
+        cls.fp_model = LlamaForCausalLM(cfg)
 
     def test_mode_transitions(self):
-        qmodel = QuantLlamaModel(
+        qmodel = QuantLlamaForCausalLM(
             self.fp_model, qcfg=PTQConfig(wrapper_variant="prefill")
         )
         self.assertIs(qmodel._mode, Mode.NO_QUANT)
@@ -74,27 +74,28 @@ class TestQuantLlamaModel(unittest.TestCase):
             self.vocab_size,
             (
                 1,
-                self.seq_len,
+                self.seq_len // 2,
             ),
         )
         _ = qmodel(x)  # gather stats
 
         qmodel.freeze_qparams()
         self.assertIs(qmodel._mode, Mode.QUANT)
+        ndf = 0
 
     def test_forward_diff(self):
-        qmodel = QuantLlamaModel(
+        qmodel = QuantLlamaForCausalLM(
             self.fp_model, qcfg=PTQConfig(wrapper_variant="prefill")
         )
         qmodel.enable_calibration()
         calib_set = []
-        for _ in range(4):
+        for index in range(4):
             inp = torch.randint(
                 0,
                 self.vocab_size,
                 (
                     1,
-                    self.seq_len,
+                    self.seq_len // (index + 1),
                 ),
             )
             _ = qmodel(inp)
@@ -102,8 +103,8 @@ class TestQuantLlamaModel(unittest.TestCase):
         qmodel.freeze_qparams()
 
         with torch.no_grad():
-            q_out = qmodel(calib_set[0])[0]
-            fp_out = self.fp_model(calib_set[0])[0]
+            q_out = qmodel(calib_set[0])["logits"]
+            fp_out = self.fp_model(calib_set[0])["logits"]
 
         diff = (fp_out - q_out).abs().mean().item()
         self.assertGreater(diff, 0.0)

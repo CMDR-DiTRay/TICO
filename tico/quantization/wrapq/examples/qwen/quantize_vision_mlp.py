@@ -1,4 +1,4 @@
-# Copyright (c) 2025 Samsung Electronics Co., Ltd. All Rights Reserved
+# Copyright (c) 2026 Samsung Electronics Co., Ltd. All Rights Reserved
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,81 +15,84 @@
 import pathlib
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForImageTextToText  # since 4.5
 
-import tico
 from tico.quantization import convert, prepare
 from tico.quantization.config.ptq import PTQConfig
 from tico.quantization.evaluation.metric import compute_peir
 from tico.quantization.evaluation.utils import plot_two_outputs
-from tico.quantization.wrapq.dtypes import INT16
 from tico.quantization.wrapq.mode import Mode
-from tico.quantization.wrapq.qscheme import QScheme
-from tico.quantization.wrapq.wrappers.llama.quant_mlp import QuantLlamaMLP
+from tico.quantization.wrapq.wrappers.qwen_vl.quant_vision_mlp import (
+    QuantQwen3VLVisionMLP,
+)
 from tico.utils.utils import SuppressWarning
 
-name = "Maykeye/TinyLLama-v0"
-model = AutoModelForCausalLM.from_pretrained(name, dtype=torch.float32)
-tokenizer = AutoTokenizer.from_pretrained(name)
-model.eval()
+torch.manual_seed(123)
+
 
 # -------------------------------------------------------------------------
-# 1. Replace layer-0’s MLP with QuantLlamaMLP
+# 0. Load a Qwen3-VL model (text tower) + tokenizer
 # -------------------------------------------------------------------------
-fp32_mlp = model.model.layers[0].mlp
-model.model.layers[0].mlp = prepare(
-    fp32_mlp, PTQConfig(default_dtype=INT16, default_qscheme=QScheme.PER_TENSOR_SYMM)
+name = "Qwen/Qwen3-VL-2B-Instruct"
+model = AutoModelForImageTextToText.from_pretrained(
+    name,
+    device_map="cpu",
+    trust_remote_code=True,
+    dtype=torch.float32,
 )
 model.eval()
 
-mlp_q = model.model.layers[0].mlp
-assert isinstance(mlp_q.wrapped, QuantLlamaMLP)
+# -------------------------------------------------------------------------
+# 1. Replace layer-0’s mlp with QuantQwen3VLVisionMLP
+# -------------------------------------------------------------------------
+orig_mlp = model.model.visual.blocks[0].mlp
+mlp_q = prepare(orig_mlp, PTQConfig())
+mlp_q.eval()
+assert isinstance(mlp_q.wrapped, QuantQwen3VLVisionMLP)
 
+inp_shape = (orig_mlp.intermediate_size, orig_mlp.hidden_size)
 # -------------------------------------------------------------------------
-# 2. Single-pass calibration
+# 2. calibration
 # -------------------------------------------------------------------------
-PROMPTS = [
-    "The quick brown fox jumps over the lazy dog.",
-    "In 2025, AI systems accelerated hardware-software co-design at scale.",
-    "양자화는 왜 어려울까? 분포, 길이, 마스크가 관건이다.",
-    "今日はいい天気ですね。ところでRoPE角度は長さに依存します。",
-    "def quicksort(arr):\n    if len(arr) <= 1: return arr\n    ...",
-    "Prices rose 3.14% — see Figure 2; emails: foo@bar.com!",
+examples = [
+    torch.randn(inp_shape),
+    torch.randn(inp_shape),
+    torch.randn(inp_shape),
 ]
 
 with torch.no_grad():
-    for prompt in PROMPTS:
-        enc = tokenizer(prompt, return_tensors="pt")
-        emb = model.model.embed_tokens(enc["input_ids"])
-        _ = mlp_q(emb)
+    for example in examples:
+        _ = mlp_q(example)
 
 convert(mlp_q)
-
 assert mlp_q._mode is Mode.QUANT, "Quantization mode should be active now."
 
 # -------------------------------------------------------------------------
 # 3. Quick diff check (INT-sim vs FP32)
 # -------------------------------------------------------------------------
+hidden = examples[0]
+
 with torch.no_grad():
-    ids = tokenizer("quant all tensors!", return_tensors="pt")
-    emb = model.model.embed_tokens(ids["input_ids"])
-    int16 = mlp_q(emb)  # INT-sim
-    fp32 = fp32_mlp(emb)  # baseline reference
+    int8_out = mlp_q(hidden)
+    fp_out = orig_mlp(hidden)
 
 print("┌───────────── Quantization Error Summary ─────────────")
-print(f"│ Mean |diff|: {(int16 - fp32).abs().mean().item():.6f}")
-print(f"│ PEIR       : {compute_peir(fp32, int16) * 100:.6f} %")
+print(f"│ Mean |diff|: {(int8_out - fp_out).abs().mean().item():.6f}")
+print(f"│ PEIR       : {compute_peir(fp_out, int8_out) * 100:.6f} %")
 print("└──────────────────────────────────────────────────────")
-print(plot_two_outputs(fp32, int16))
+print(plot_two_outputs(fp_out, int8_out))
 
 # -------------------------------------------------------------------------
 # 4. Export the quantized block
 # -------------------------------------------------------------------------
-save_path = pathlib.Path("mlp.q.circle")
-example_in = (torch.randn(1, 1, model.config.hidden_size),)
+import tico
+
+save_path = pathlib.Path("qwen3vl_vision_mlp.q.circle")
+
+example = torch.randn(inp_shape)
 
 with SuppressWarning(UserWarning, ".*"):
-    cm = tico.convert(mlp_q, example_in)
+    cm = tico.convert(mlp_q, (example,))
 cm.save(save_path)
 
 print(f"Quantized Circle model saved to {save_path.resolve()}")
